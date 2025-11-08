@@ -23,21 +23,6 @@ section[data-testid="stSidebar"] > div {
 </style>
 """, unsafe_allow_html=True)
 
-
-# --- Futuristic Dashboard Styling (Dark + Neon Accents) ---
-st.markdown("""
-
-""", unsafe_allow_html=True)
-# --- end css ---
-
-# Modern UI Styling
-st.markdown(
-    """
-    
-    """,
-    unsafe_allow_html=True
-)
-
 import sqlite3
 import pandas as pd
 from datetime import datetime, timedelta
@@ -46,26 +31,17 @@ import time
 from io import BytesIO
 import os
 import sys
+import re
 
 def get_resource_path(relative_path):
-    """
-    Dapatkan jalur absolut ke sumber daya, bekerja untuk pengembangan
-    dan untuk PyInstaller di jalur tmp-nya.
-    """
     try:
-        # PyInstaller creates a temp folder and stores path in _MEIPASS
         base_path = sys._MEIPASS
     except Exception:
-        # Jika bukan PyInstaller (misalnya, development environment)
         base_path = os.path.abspath(".")
-
-    # Pastikan database disimpan di direktori root saat diekstrak
     return os.path.join(base_path, relative_path)
 
-# Gunakan variabel global untuk jalur database
 DB_PATH = get_resource_path('inventory_rumah.db')
 
-# Konfigurasi halaman
 st.set_page_config(
     page_title="Inventory Gudang",
     page_icon="📦",
@@ -88,9 +64,7 @@ if 'import_barang_config' not in st.session_state:
 if 'selected_sheets_barang' not in st.session_state:
     st.session_state.selected_sheets_barang = {}
 
-
 # ================= LOGIN & ROLE SYSTEM =================
-# User database (simple dictionary)
 users = {
     "admin": {"password": "admin123", "role": "editor"},
     "viewer1": {"password": "viewer123", "role": "viewer"},
@@ -112,35 +86,26 @@ if st.session_state.user_role is None:
             st.error("❌ Username atau Password salah")
     st.stop()
 
-# ================= END LOGIN SYSTEM =================
+# ================= FUNGSI HELPER =================
 
-# Fungsi untuk format tanggal tanpa jam
 def format_date_only(df, date_columns):
-    """Convert datetime columns to date only format (YYYY-MM-DD)"""
     for col in date_columns:
         if col in df.columns:
-            # Menggunakan .dt.date untuk mengonversi datetime/timestamp ke objek date Python
             df[col] = pd.to_datetime(df[col], errors='coerce').apply(lambda x: x.date() if pd.notna(x) else None)
     return df
 
-# Fungsi untuk export ke Excel dengan download button
 def create_excel_download(df, filename_prefix, button_label):
-    """Create Excel file and return download button"""
     output = BytesIO()
     with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
         df.to_excel(writer, index=False, sheet_name='Data')
         worksheet = writer.sheets['Data']
-
-        # Aktifkan Autofilter
         if not df.empty:
             max_row = len(df)
             max_col = len(df.columns) - 1
             worksheet.autofilter(0, 0, max_row, max_col)
-
     output.seek(0)
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     filename = f"{filename_prefix}_{timestamp}.xlsx"
-
     st.download_button(
         label=button_label,
         data=output,
@@ -148,7 +113,15 @@ def create_excel_download(df, filename_prefix, button_label):
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
 
-# Inisialisasi database
+def generate_unit_options():
+    units = []
+    for letter in ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I']:
+        for number in range(1, 15):
+            units.append(f"{letter}{number}")
+    return units
+
+# ================= DATABASE FUNCTIONS =================
+
 def init_db():
     conn = sqlite3.connect('inventory_rumah.db')
     c = conn.cursor()
@@ -187,30 +160,177 @@ def init_db():
                 FOREIGN KEY (barang_id) REFERENCES barang (id)
                 )''')
 
+    c.execute('''CREATE TABLE IF NOT EXISTS hpp (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                unit TEXT NOT NULL,
+                tanggal DATE NOT NULL,
+                material TEXT NOT NULL,
+                harga REAL NOT NULL,
+                keterangan TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )''')
+
     conn.commit()
     conn.close()
 
-def generate_unit_options():
-    units = []
-    for letter in ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I']:
-        for number in range(1, 15):
-            units.append(f"{letter}{number}")
-    return units
+# ================= HPP FUNCTIONS =================
+
+def read_pengeluaran_material(path, sheet_name="Pengeluaran Material", verbose=True):
+    df_raw = pd.read_excel(path, sheet_name=sheet_name, header=None)
+    
+    data_rows = []
+    skipped_rows = []
+
+    for idx, row in df_raw.iterrows():
+        tanggal_raw = row[1]
+        material_raw = row[2]
+        unit_raw = row[3]
+        harga_raw = row[5]
+        
+        material_str = str(material_raw).lower().strip()
+        harga_str = str(harga_raw).strip()
+        
+        if material_str in ['nan', 'none', ''] or not material_str:
+            continue
+        
+        header_exact = ['material', 'tanggal', 'keterangan', 'no', 'item']
+        if material_str in header_exact:
+            skipped_rows.append(f"Row {idx}: Header row")
+            continue
+        
+        if re.match(r'^(jumlah|total|subtotal|grand total|catatan|summary)', material_str):
+            skipped_rows.append(f"Row {idx}: Summary row - '{material_str[:50]}'")
+            continue
+        
+        if not harga_str or harga_str.lower() in ["nan", "none", ""]:
+            continue
+        
+        harga_clean = re.sub(r'[^\d.-]', '', harga_str)
+        
+        try:
+            harga = float(harga_clean)
+            if harga <= 0 or harga > 100_000_000:
+                skipped_rows.append(f"Row {idx}: Harga ekstrem - {harga:,.0f}")
+                continue
+        except (ValueError, TypeError):
+            skipped_rows.append(f"Row {idx}: Invalid harga '{harga_raw}'")
+            continue
+
+        tanggal = None
+        if pd.notna(tanggal_raw) and str(tanggal_raw).strip():
+            try:
+                tanggal = pd.to_datetime(tanggal_raw, errors='coerce')
+            except:
+                pass
+        
+        material = str(material_raw).strip() if pd.notna(material_raw) else ""
+        unit = str(unit_raw).strip() if pd.notna(unit_raw) else ""
+        
+        data_rows.append([tanggal, material, unit, harga])
+
+    df = pd.DataFrame(data_rows, columns=["Tanggal", "Material", "Unit", "Harga"])
+    total_harga = df["Harga"].sum()
+    total_rupiah = f"Rp {total_harga:,.0f}".replace(",", ".")
+
+    if verbose:
+        st.info(f"📊 Total Rows Terbaca: {len(df)} | Total Harga: {total_rupiah}")
+
+    return df, total_harga
+
+def add_hpp_data(unit, tanggal, material, harga, keterangan=""):
+    conn = sqlite3.connect('inventory_rumah.db')
+    c = conn.cursor()
+    # normalize tanggal to YYYY-MM-DD string for sqlite
+    if isinstance(tanggal, pd.Timestamp):
+        tanggal = tanggal.strftime('%Y-%m-%d')
+    elif isinstance(tanggal, datetime):
+        tanggal = tanggal.date().strftime('%Y-%m-%d')
+    elif isinstance(tanggal, str):
+        try:
+            parsed = pd.to_datetime(tanggal, errors='coerce')
+            if pd.notna(parsed):
+                tanggal = parsed.strftime('%Y-%m-%d')
+        except:
+            pass
+    c.execute("""INSERT INTO hpp (unit, tanggal, material, harga, keterangan)
+                 VALUES (?, ?, ?, ?, ?)""", (unit, tanggal, material, harga, keterangan))
+    conn.commit()
+    conn.close()
+
+def get_hpp_data(unit=None, start_date=None, end_date=None):
+    conn = sqlite3.connect('inventory_rumah.db')
+    df = pd.read_sql_query("SELECT * FROM hpp", conn)
+    conn.close()
+
+    if df.empty:
+        return df
+
+    # --- parsing tanggal: coba beberapa format, fallback ke to_datetime ---
+    if 'tanggal' in df.columns:
+        # jika tipe sudah datetime, biarkan; jika string, coba parse format yang kita gunakan
+        if not pd.api.types.is_datetime64_any_dtype(df['tanggal']):
+            # first try YYYY-MM-DD then try DD/MM/YYYY then generic parse
+            def safe_parse(x):
+                if pd.isna(x):
+                    return pd.NaT
+                s = str(x).strip()
+                for fmt in ("%Y-%m-%d", "%d/%m/%Y"):
+                    try:
+                        return pd.to_datetime(s, format=fmt, errors='raise')
+                    except Exception:
+                        continue
+                # last resort: let pandas infer
+                return pd.to_datetime(s, errors='coerce')
+            df['tanggal'] = df['tanggal'].apply(safe_parse)
+        else:
+            df['tanggal'] = pd.to_datetime(df['tanggal'], errors='coerce')
+
+    # --- filter unit ---
+    if unit and unit not in ["Semua", "Semua Unit"]:
+        df = df[df['unit'] == unit]
+
+    # --- filter tanggal (start_date/end_date may be date objects or strings) ---
+    if start_date is not None:
+        start_dt = pd.to_datetime(start_date, errors='coerce')
+        if pd.notna(start_dt):
+            df = df[df['tanggal'] >= start_dt]
+
+    if end_date is not None:
+        end_dt = pd.to_datetime(end_date, errors='coerce')
+        if pd.notna(end_dt):
+            df = df[df['tanggal'] <= end_dt]
+
+    # --- untuk konsistensi tampilan/ekspor: format tanggal ke 'DD/MM/YYYY' ---
+    if 'tanggal' in df.columns:
+        df['tanggal'] = df['tanggal'].dt.strftime('%d/%m/%Y')
+
+    # sort descending by tanggal (opsional)
+    if 'tanggal' in df.columns:
+        try:
+            df = df.sort_values(by='tanggal', ascending=False)
+        except Exception:
+            pass
+
+    return df
+
+
+def delete_hpp(hpp_id):
+    conn = sqlite3.connect('inventory_rumah.db')
+    c = conn.cursor()
+    c.execute("DELETE FROM hpp WHERE id = ?", (hpp_id,))
+    conn.commit()
+    conn.close()
+    return True, "Data HPP berhasil dihapus"
+
+# ================= BARANG FUNCTIONS =================
 
 def add_barang(nama, stok, besaran, gudang, tanggal_dibuat):
     conn = sqlite3.connect('inventory_rumah.db')
     c = conn.cursor()
-    # Menambahkan tanggal_dibuat ke kueri INSERT
     c.execute("INSERT INTO barang (nama_barang, stok, besaran_stok, gudang, created_at) VALUES (?, ?, ?, ?, ?)",
               (nama, stok, besaran, gudang, tanggal_dibuat))
-
-st.sidebar.write("---")
-if st.sidebar.button("🚪 Logout"):
-    st.session_state.user_role = None
-    st.rerun()
     barang_id = c.lastrowid
 
-    # Catat riwayat stok awal jika stok > 0
     if stok > 0:
         c.execute("""INSERT INTO riwayat_stok
                   (barang_id, nama_barang, jumlah_tambah, stok_sebelum, stok_sesudah, gudang, tanggal_tambah)
@@ -235,10 +355,7 @@ def kurangi_stok(barang_id, stok_dikurangi, tanggal_transaksi):
             return False, f"Stok tidak mencukupi. Stok tersedia: {stok_sebelum}"
 
         stok_sesudah = stok_sebelum - stok_dikurangi
-
         c.execute("UPDATE barang SET stok = stok - ? WHERE id = ?", (stok_dikurangi, barang_id))
-
-        # Menambahkan tanggal_transaksi ke riwayat stok
         c.execute("""INSERT INTO riwayat_stok
                   (barang_id, nama_barang, jumlah_tambah, stok_sebelum, stok_sesudah, gudang, tanggal_tambah)
                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
@@ -263,8 +380,6 @@ def update_stok(barang_id, stok_tambahan, tanggal_transaksi):
         stok_sesudah = stok_sebelum + stok_tambahan
 
         c.execute("UPDATE barang SET stok = stok + ? WHERE id = ?", (stok_tambahan, barang_id))
-
-        # Menambahkan tanggal_transaksi ke riwayat stok
         c.execute("""INSERT INTO riwayat_stok
                   (barang_id, nama_barang, jumlah_tambah, stok_sebelum, stok_sesudah, gudang, tanggal_tambah)
                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
@@ -277,7 +392,6 @@ def get_barang():
     conn = sqlite3.connect('inventory_rumah.db')
     df = pd.read_sql_query("SELECT * FROM barang ORDER BY nama_barang", conn)
     conn.close()
-    # Jangan format tanggal di sini, biarkan format asli untuk ekspor dan pemrosesan.
     return df
 
 def get_barang_by_id(barang_id):
@@ -378,7 +492,6 @@ def add_sample_data():
 
     c.execute("SELECT COUNT(*) FROM barang")
     if c.fetchone()[0] == 0:
-        # Masukkan data sampel dengan tanggal saat ini
         today = datetime.now().date()
         sample_data = [
             ('Semen', 50, 'Sak', 'Gudang 1', today),
@@ -401,11 +514,10 @@ add_sample_data()
 
 # Header aplikasi
 st.title("📦 Aplikasi Inventory Gudang")
-st.markdown("*🚀 Running on Google Colab - Version 3.7 (Chart Update)*")
+st.markdown("*🚀 Running on Google Colab - Version 4.0 (HPP Feature)*")
 st.markdown("---")
 
 # Sidebar
-
 st.sidebar.title("📋 Menu Navigasi")
 
 if st.session_state.user_role == "viewer":
@@ -414,6 +526,7 @@ if st.session_state.user_role == "viewer":
         [
             "🏠 Dashboard",
             "📊 Laporan",
+            "💰 Laporan HPP",
             "⚠️ Stok Rendah"
         ]
     )
@@ -425,15 +538,22 @@ else:
             "📦 Kelola Barang",
             "📝 Penggunaan",
             "📊 Laporan",
+            "💰 Kelola HPP",
+            "💰 Laporan HPP",
             "⚠️ Stok Rendah",
             "📥 Import/Export Data"
         ]
     )
 
 st.sidebar.write("---")
+if st.sidebar.button("🚪 Logout"):
+    st.session_state.user_role = None
+    st.rerun()
+
+st.sidebar.write("---")
 st.sidebar.caption("Gunakan menu untuk navigasi sistem")
 
-# Dashboard
+# ================= MENU DASHBOARD =================
 if menu == "🏠 Dashboard":
     st.header("🏠 Dashboard Inventory")
 
@@ -452,7 +572,6 @@ if menu == "🏠 Dashboard":
         st.metric("📊 Total Stok", total_stok)
 
     with col3:
-        # Konversi tanggal pinjam di DataFrame menjadi objek date untuk perbandingan
         penggunaan_hari_ini = len(df_peminjaman[pd.to_datetime(df_peminjaman['tanggal_pinjam'], errors='coerce').dt.date == datetime.now().date()]) if not df_peminjaman.empty else 0
         st.metric("📝 Penggunaan Hari Ini", penggunaan_hari_ini)
 
@@ -493,7 +612,7 @@ if menu == "🏠 Dashboard":
     else:
         st.info("🔭 Belum ada data barang.")
 
-# Kelola Barang
+# ================= MENU KELOLA BARANG =================
 elif menu == "📦 Kelola Barang":
     st.header("📦 Kelola Barang")
 
@@ -507,28 +626,24 @@ elif menu == "📦 Kelola Barang":
             with col1:
                 nama_barang = st.text_input("🏷 Nama Barang")
                 stok = st.number_input("📊 Stok Awal", min_value=0, value=0, step=1)
-                # PERBAIKAN 1: Tambahkan input tanggal
                 tanggal_dibuat = st.date_input("📅 Tanggal Masuk/Dibuat", value=datetime.now().date())
             with col2:
-                besaran_stok = st.selectbox("📏 Besaran Stok",
-                                             ["kg", "sak", "pcs", "liter", "box", "karung", "dus", "meter", "botol", "kaleng"])
+                besaran_stok = st.text_input("📏 Besaran Stok (contoh: kg, sak, pcs, liter, box)", value="pcs")
                 gudang = st.selectbox("🏭 Gudang", ["Gudang 1", "Gudang 2"])
 
             submitted = st.form_submit_button("➕ Tambah Barang", use_container_width=True)
 
             if submitted:
-                if nama_barang.strip():
-                    # Panggil fungsi dengan argumen tanggal_dibuat
-                    add_barang(nama_barang.strip(), stok, besaran_stok, gudang, tanggal_dibuat)
+                if nama_barang.strip() and besaran_stok.strip():
+                    add_barang(nama_barang.strip(), stok, besaran_stok.strip(), gudang, tanggal_dibuat)
                     st.success(f"✅ Barang '{nama_barang}' berhasil ditambahkan!")
                     time.sleep(1)
                     st.rerun()
                 else:
-                    st.error("❌ Nama barang harus diisi!")
+                    st.error("❌ Nama barang dan besaran stok harus diisi!")
 
     with tab2:
         st.subheader("👁️ Daftar Semua Barang")
-        # PERBAIKAN 2: Hanya tampilkan kolom yang relevan (tanpa created_at)
         display_cols_barang = ['id', 'nama_barang', 'stok', 'besaran_stok', 'gudang']
         df_barang = get_barang()
 
@@ -552,7 +667,6 @@ elif menu == "📦 Kelola Barang":
             st.info(f"📊 Menampilkan {len(df_filtered)} dari {len(df_barang)} barang")
             st.dataframe(df_filtered[display_cols_barang], use_container_width=True)
 
-            # Download Excel
             if not df_filtered.empty:
                 create_excel_download(df_filtered[display_cols_barang], "data_barang", "📥 Download Excel")
         else:
@@ -581,14 +695,12 @@ elif menu == "📦 Kelola Barang":
                     stok_tambahan = st.number_input("📊 Tambah Stok", min_value=0, value=0, step=1,
                                                      help="Masukkan jumlah yang akan ditambahkan ke stok saat ini")
 
-                # PERBAIKAN 4: Tambahkan input tanggal transaksi
                 tanggal_transaksi = st.date_input("📅 Tanggal Penambahan", value=datetime.now().date())
 
                 submitted = st.form_submit_button("🔄 Tambah Stok", use_container_width=True)
 
                 if submitted:
                     if stok_tambahan > 0:
-                        # Panggil fungsi dengan tanggal transaksi
                         update_stok(barang_id, stok_tambahan, tanggal_transaksi)
                         new_stock = stok_sekarang + stok_tambahan
                         st.success(f"✅ Stok berhasil diupdate dari {stok_sekarang} menjadi {new_stock}!")
@@ -623,14 +735,12 @@ elif menu == "📦 Kelola Barang":
                     stok_dikurangi = st.number_input("📉 Kurangi Stok", min_value=0, max_value=stok_sekarang, value=0, step=1,
                                                      help="Masukkan jumlah yang akan dikurangi dari stok saat ini")
 
-                # PERBAIKAN 4: Tambahkan input tanggal transaksi
                 tanggal_transaksi = st.date_input("📅 Tanggal Pengurangan", value=datetime.now().date())
 
                 submitted = st.form_submit_button("➖ Kurangi Stok", use_container_width=True)
 
                 if submitted:
                     if stok_dikurangi > 0:
-                        # Panggil fungsi dengan tanggal transaksi
                         success, message = kurangi_stok(barang_id, stok_dikurangi, tanggal_transaksi)
                         if success:
                             st.success(f"✅ {message}. Stok sekarang: {stok_sekarang - stok_dikurangi}")
@@ -735,7 +845,6 @@ elif menu == "📦 Kelola Barang":
                     with col2:
                         st.metric("📉 Total Stok Dikurangi", total_pengurangan)
 
-                    # Download Excel
                     create_excel_download(display_df[display_cols], "riwayat_stok", "📥 Download Excel")
                 else:
                     st.info("🔭 Tidak ada riwayat perubahan stok dalam rentang tanggal tersebut.")
@@ -767,6 +876,161 @@ elif menu == "📦 Kelola Barang":
                         if confirm:
                             riwayat_id = riwayat_options[selected_riwayat]
                             success, message = delete_riwayat_stok(riwayat_id)
+
+                            if success:
+                                st.success(f"✅ {message}")
+                                time.sleep(1)
+                                st.rerun()
+                            else:
+                                st.error(f"❌ {message}")
+                        else:
+                            st.error("❌ Harap centang konfirmasi untuk menghapus riwayat!")
+            else:
+                st.info("🔭 Belum ada riwayat untuk dihapus.")
+
+# ================= MENU PENGGUNAAN =================
+elif menu == "📝 Penggunaan":
+    st.header("📝 Kelola Penggunaan")
+
+    tab1, tab2 = st.tabs(["📤 Gunakan Barang", "📜 Riwayat Penggunaan"])
+
+    with tab1:
+        st.subheader("📤 Gunakan Barang")
+
+        if st.session_state.get('submission_success', False):
+            st.success("✅ Penggunaan berhasil diproses!")
+            st.balloons()
+            st.session_state.submission_success = False
+
+        df_barang = get_barang()
+        df_available = df_barang[df_barang['stok'] > 0] if not df_barang.empty else pd.DataFrame()
+
+        if not df_available.empty:
+            barang_options = {f"{row['nama_barang']} ({row['gudang']}) - Tersedia: {row['stok']} {row['besaran_stok']}": row['id']
+                            for _, row in df_available.iterrows()}
+
+            with st.form("form_penggunaan_fixed", clear_on_submit=False):
+                col1, col2 = st.columns(2)
+                with col1:
+                    selected_barang = st.selectbox("📦 Pilih Barang", list(barang_options.keys()))
+                    jumlah_pinjam = st.number_input("📊 Jumlah Gunakan", min_value=1, value=1, step=1)
+                    unit_options = generate_unit_options()
+                    unit = st.selectbox("🏠 Digunakan untuk Unit", unit_options)
+                with col2:
+                    tanggal_pinjam = st.date_input("📅 Tanggal Gunakan", value=datetime.now().date())
+                    st.write("")
+
+                submitted = st.form_submit_button("📤 Konfirmasi Penggunaan", use_container_width=True)
+
+                if submitted and not st.session_state.get('form_submitted', False):
+                    st.session_state.form_submitted = True
+
+                    barang_id = barang_options[selected_barang]
+                    barang_data = get_barang_by_id(barang_id)
+
+                    if barang_data:
+                        success, message = add_peminjaman(
+                            barang_id,
+                            barang_data[1],
+                            jumlah_pinjam,
+                            tanggal_pinjam,
+                            unit,
+                            barang_data[3],
+                            barang_data[4]
+                        )
+
+                        if success:
+                            st.session_state.submission_success = True
+                            st.session_state.form_submitted = False
+                            st.rerun()
+                        else:
+                            st.error(f"❌ {message}")
+                            st.session_state.form_submitted = False
+                    else:
+                        st.error("❌ Barang tidak ditemukan!")
+                        st.session_state.form_submitted = False
+
+                elif submitted:
+                    st.info("⏳ Penggunaan sedang diproses...")
+
+        else:
+            st.warning("⚠️ Tidak ada barang yang tersedia untuk digunakan.")
+
+    with tab2:
+        st.subheader("📜 Riwayat Penggunaan")
+
+        tab_view, tab_delete = st.tabs(["👁️ Lihat Riwayat", "🗑️ Hapus Riwayat"])
+
+        with tab_view:
+            df_peminjaman = get_peminjaman()
+
+            if not df_peminjaman.empty:
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    start_date = st.date_input("📅 Dari Tanggal", value=datetime.now().date() - timedelta(days=30))
+                with col2:
+                    end_date = st.date_input("📅 Sampai Tanggal", value=datetime.now().date())
+                with col3:
+                    search_barang = st.text_input("🔍 Cari Barang")
+
+                mask = (pd.to_datetime(df_peminjaman['tanggal_pinjam'], errors='coerce').dt.date >= start_date) & (pd.to_datetime(df_peminjaman['tanggal_pinjam'], errors='coerce').dt.date <= end_date)
+                df_filtered = df_peminjaman.loc[mask]
+
+                if search_barang:
+                    df_filtered = df_filtered[df_filtered['nama_barang'].str.contains(search_barang, case=False)]
+
+                if not df_filtered.empty:
+                    st.info(f"📊 Menampilkan {len(df_filtered)} transaksi penggunaan")
+
+                    display_df = df_filtered.copy()
+                    display_df = display_df.rename(columns={
+                        'id': 'ID',
+                        'nama_barang': 'Nama Barang',
+                        'jumlah_pinjam': 'Jumlah Penggunaan',
+                        'tanggal_pinjam': 'Tanggal Penggunaan',
+                        'unit': 'Unit',
+                        'besaran_stok': 'Satuan',
+                        'gudang': 'Gudang'
+                    })
+
+                    st.dataframe(display_df[['ID', 'Nama Barang', 'Jumlah Penggunaan', 'Tanggal Penggunaan', 'Unit', 'Satuan', 'Gudang']], use_container_width=True)
+
+                    total_transaksi = len(df_filtered)
+                    total_barang = df_filtered['jumlah_pinjam'].sum()
+
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.metric("📊 Total Transaksi", total_transaksi)
+                    with col2:
+                        st.metric("📦 Total Barang Digunakan", total_barang)
+
+                    create_excel_download(display_df[['ID', 'Nama Barang', 'Jumlah Penggunaan', 'Tanggal Penggunaan', 'Unit', 'Satuan', 'Gudang']], "riwayat_penggunaan", "📥 Download Excel")
+                else:
+                    st.info("🔭 Tidak ada penggunaan dalam rentang tanggal tersebut.")
+            else:
+                st.info("🔭 Belum ada riwayat penggunaan.")
+
+        with tab_delete:
+            st.warning("⚠️ **PERHATIAN:** Hapus riwayat hanya untuk koreksi kesalahan input. Stok barang TIDAK akan dikembalikan!")
+
+            df_peminjaman = get_peminjaman()
+
+            if not df_peminjaman.empty:
+                penggunaan_options = {f"ID-{row['id']}: {row['nama_barang']} ({row['jumlah_pinjam']} {row['besaran_stok']}) - Unit {row['unit']} - {row['tanggal_pinjam']}": row['id']
+                                     for _, row in df_peminjaman.iterrows()}
+
+                with st.form("form_hapus_penggunaan"):
+                    selected_penggunaan = st.selectbox("🗑️ Pilih riwayat penggunaan yang akan dihapus", list(penggunaan_options.keys()))
+
+                    st.markdown("**Konfirmasi penghapusan:**")
+                    confirm = st.checkbox("✅ Saya yakin ingin menghapus riwayat ini")
+
+                    submitted = st.form_submit_button("🗑️ HAPUS RIWAYAT", type="secondary", use_container_width=True)
+
+                    if submitted:
+                        if confirm:
+                            penggunaan_id = penggunaan_options[selected_penggunaan]
+                            success, message = delete_penggunaan(penggunaan_id)
 
                             if success:
                                 st.success(f"✅ {message}")
@@ -1125,6 +1389,400 @@ elif menu == "📊 Laporan":
 
     else:
         st.info("🔭 Belum ada data penggunaan untuk membuat laporan.")
+
+# Kelola HPP
+elif menu == "💰 Kelola HPP":
+    st.header("💰 Kelola HPP (Harga Pokok Produksi)")
+
+    tab1, tab2, tab3 = st.tabs(["➕ Input HPP Manual", "📥 Import HPP dari Excel", "🗑️ Hapus Data HPP"])
+
+    with tab1:
+        st.subheader("➕ Input Data HPP Manual")
+
+        with st.form("form_input_hpp", clear_on_submit=True):
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                unit_options = generate_unit_options()
+                unit_hpp = st.selectbox("🏠 Unit", unit_options)
+                tanggal_hpp = st.date_input("📅 Tanggal", value=datetime.now().date())
+                material_hpp = st.text_input("🔨 Nama Material")
+            
+            with col2:
+                harga_hpp = st.number_input("💵 Harga (Rp)", min_value=0, value=0, step=1000)
+                keterangan_hpp = st.text_area("📝 Keterangan (Optional)", height=100)
+
+            submitted = st.form_submit_button("➕ Tambah Data HPP", use_container_width=True)
+
+            if submitted:
+                if material_hpp.strip() and harga_hpp > 0:
+                    add_hpp_data(unit_hpp, tanggal_hpp, material_hpp.strip(), harga_hpp, keterangan_hpp.strip())
+                    st.success(f"✅ Data HPP untuk {material_hpp} berhasil ditambahkan!")
+                    time.sleep(1)
+                    st.rerun()
+                else:
+                    st.error("❌ Material dan harga harus diisi dengan benar!")
+
+        with tab2:
+            st.subheader("📥 Import Data HPP dari Excel")
+            st.info("📋 Format Excel: Sheet 'Pengeluaran Material' dengan kolom Tanggal, Material, Unit, Harga")
+
+            uploaded_file_hpp = st.file_uploader("Upload File Excel HPP", type=['xlsx', 'xls'], key="upload_hpp")
+
+            if uploaded_file_hpp is not None:
+                try:
+                    excel_file = pd.ExcelFile(uploaded_file_hpp)
+                    sheet_names = excel_file.sheet_names
+                    st.success(f"✅ File berhasil diupload! Ditemukan {len(sheet_names)} sheet.")
+
+                    selected_sheet = st.selectbox("📋 Pilih Sheet", sheet_names)
+
+                    # Baca dan preview data
+                    df_preview, total_preview = read_pengeluaran_material(uploaded_file_hpp, sheet_name=selected_sheet, verbose=False)
+
+                    if not df_preview.empty:
+                        st.write("**Preview Data (10 baris terakhir):**")
+                        st.dataframe(df_preview.tail(10), use_container_width=True)
+                        st.metric("💰 Total HPP", f"Rp {total_preview:,.0f}".replace(",", "."))
+
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            unit_for_import = st.selectbox("🏠 Unit untuk data ini", generate_unit_options(), key="unit_import_hpp")
+                        with col2:
+                            keterangan_import = st.text_input("📝 Keterangan (Optional)", key="ket_import_hpp")
+
+                        if st.button("🚀 Import Data HPP", type="primary", use_container_width=True):
+                            with st.spinner("Memproses import..."):
+                                conn = sqlite3.connect('inventory_rumah.db')
+                                c = conn.cursor()
+
+                                imported_count = 0
+                                for _, row in df_preview.iterrows():
+                                    if pd.notna(row['Tanggal']) and pd.notna(row['Harga']):
+                                        tanggal_val = row['Tanggal']
+                                        # jika Timestamp atau datetime -> format ke DD/MM/YYYY
+                                        if isinstance(tanggal_val, (pd.Timestamp, datetime)):
+                                            tanggal_str = tanggal_val.strftime('%d/%m/%Y')
+                                        elif isinstance(tanggal_val, str):
+                                            # possible raw strings: coba bersihkan lalu parse / normalisasi
+                                            t = tanggal_val.strip()
+                                            # jika format sudah YYYY-MM-DD, convert dulu ke dd/mm/YYYY
+                                            try:
+                                                parsed = pd.to_datetime(t, errors='coerce', dayfirst=False)
+                                                if pd.notna(parsed):
+                                                    # format menjadi DD/MM/YYYY
+                                                    tanggal_str = parsed.strftime('%d/%m/%Y')
+                                                else:
+                                                    tanggal_str = t  # fallback: simpan apa adanya
+                                            except:
+                                                tanggal_str = t
+                                        else:
+                                            tanggal_str = str(tanggal_val)
+
+                                        c.execute("""INSERT INTO hpp (unit, tanggal, material, harga, keterangan)
+                                                    VALUES (?, ?, ?, ?, ?)""",
+                                                (unit_for_import, tanggal_str, row['Material'], row['Harga'], keterangan_import))
+                                        imported_count += 1
+
+                                conn.commit()
+                                conn.close()
+
+                                st.success(f"✅ Berhasil import {imported_count} data HPP!")
+                                st.balloons()
+                                time.sleep(2)
+                                st.rerun()
+
+                except Exception as e:
+                    st.error(f"❌ Error: {str(e)}")
+
+
+    with tab3:
+        st.subheader("🗑️ Hapus Data HPP")
+        st.warning("⚠️ Penghapusan data HPP bersifat permanen!")
+
+        df_hpp = get_hpp_data()
+
+        if not df_hpp.empty:
+            col1, col2 = st.columns(2)
+            with col1:
+                filter_unit_delete = st.selectbox("🏠 Filter Unit", ["Semua"] + generate_unit_options(), key="delete_unit_filter")
+            with col2:
+                search_material_delete = st.text_input("🔍 Cari Material", key="delete_material_search")
+
+            df_filtered = df_hpp.copy()
+            if filter_unit_delete != "Semua":
+                df_filtered = df_filtered[df_filtered['unit'] == filter_unit_delete]
+            if search_material_delete:
+                df_filtered = df_filtered[df_filtered['material'].str.contains(search_material_delete, case=False, na=False)]
+
+            if not df_filtered.empty:
+                hpp_options = {f"ID-{row['id']}: {row['unit']} - {row['material']} - Rp {row['harga']:,.0f} ({row['tanggal']})": row['id']
+                               for _, row in df_filtered.iterrows()}
+
+                with st.form("form_hapus_hpp"):
+                    selected_hpp = st.selectbox("🗑️ Pilih data yang akan dihapus", list(hpp_options.keys()))
+
+                    confirm = st.checkbox("✅ Saya yakin ingin menghapus data ini")
+
+                    submitted = st.form_submit_button("🗑️ HAPUS DATA", type="secondary", use_container_width=True)
+
+                    if submitted:
+                        if confirm:
+                            hpp_id = hpp_options[selected_hpp]
+                            success, message = delete_hpp(hpp_id)
+
+                            if success:
+                                st.success(f"✅ {message}")
+                                time.sleep(1)
+                                st.rerun()
+                        else:
+                            st.error("❌ Harap centang konfirmasi untuk menghapus data!")
+            else:
+                st.info("🔭 Tidak ada data HPP yang sesuai filter.")
+        else:
+            st.info("🔭 Belum ada data HPP.")
+
+# Laporan HPP
+elif menu == "💰 Laporan HPP":
+    st.header("💰 Laporan HPP (Harga Pokok Produksi)")
+
+    tab1, tab2, tab3 = st.tabs(["📊 Laporan per Unit", "📈 Laporan Periode", "📋 Ringkasan Total"])
+
+    with tab1:
+        st.subheader("📊 Laporan HPP per Unit")
+
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            unit_options = ["Semua Unit"] + generate_unit_options()
+            selected_unit_hpp = st.selectbox(
+                "🏠 Pilih Unit",
+                unit_options,
+                key="filter_unit_hpp"
+            )
+        with col2:
+            start_date_hpp = st.date_input(
+                "📅 Dari Tanggal",
+                value=datetime.now().date() - timedelta(days=30),
+                key="hpp_start"
+            )
+        with col3:
+            end_date_hpp = st.date_input(
+                "📅 Sampai Tanggal",
+                value=datetime.now().date(),
+                key="hpp_end"
+            )
+
+        # --- Ambil data sesuai filter ---
+        df_hpp_filtered = get_hpp_data(
+            unit=None if selected_unit_hpp == "Semua Unit" else selected_unit_hpp,
+            start_date=start_date_hpp,
+            end_date=end_date_hpp
+        )
+
+        if not df_hpp_filtered.empty:
+            df_hpp_filtered['tanggal'] = pd.to_datetime(
+                df_hpp_filtered['tanggal'], errors='coerce', dayfirst=True
+            ).dt.strftime('%d/%m/%Y')
+
+            total_hpp = df_hpp_filtered['harga'].sum()
+            jumlah_transaksi = len(df_hpp_filtered)
+
+            col1, col2 = st.columns(2)
+            with col1:
+                st.metric("💰 Total HPP", f"Rp {total_hpp:,.0f}".replace(",", "."))
+            with col2:
+                st.metric("📝 Jumlah Transaksi", jumlah_transaksi)
+
+            st.dataframe(
+                df_hpp_filtered[['id', 'unit', 'tanggal', 'material', 'harga', 'keterangan']],
+                width="stretch"
+            )
+            create_excel_download(
+                df_hpp_filtered[['id', 'unit', 'tanggal', 'material', 'harga', 'keterangan']],
+                "laporan_hpp_unit",
+                "📥 Download Excel"
+            )
+            chart_data = (
+                df_hpp_filtered.groupby('material')['harga']
+                .sum()
+                .reset_index()
+                .sort_values('harga', ascending=False)
+                .head(10)
+            )
+            fig = px.bar(
+                chart_data,
+                x='material',
+                y='harga',
+                title=f"Top 10 Material Termahal - {selected_unit_hpp}",
+                labels={'harga': 'Total Harga (Rp)', 'material': 'Material'}
+            )
+            fig.update_layout(xaxis_tickangle=-45)
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("🔭 Tidak ada data HPP untuk filter yang dipilih.")
+
+    with tab2:
+        st.subheader("📈 Laporan HPP Periode")
+
+        df_hpp = get_hpp_data()
+
+        if not df_hpp.empty:
+            # konversi tanggal ke datetime dayfirst agar sesuai format dd/mm/yyyy
+            df_hpp['tanggal'] = pd.to_datetime(
+                df_hpp['tanggal'], errors='coerce', dayfirst=True
+            )
+
+            # Filter Unit
+            filter_unit = st.selectbox(
+                "🏠 Pilih Unit",
+                ["Semua"] + sorted(df_hpp['unit'].dropna().unique().tolist()),
+                key="filter_unit_periode"
+            )
+            if filter_unit != "Semua":
+                df_hpp = df_hpp[df_hpp['unit'] == filter_unit]
+
+            # Tambah kolom bulan (format Month/Year)
+            df_hpp['bulan'] = df_hpp['tanggal'].dt.strftime('%m/%Y')
+
+            # Laporan Bulanan
+            st.markdown("### 📅 Laporan Bulanan")
+            monthly_data = (
+                df_hpp.groupby(['bulan', 'unit'])['harga']
+                .sum()
+                .reset_index()
+                .rename(columns={'bulan': 'Bulan', 'unit': 'Unit', 'harga': 'Total HPP'})
+            )
+
+            if not monthly_data.empty:
+                st.dataframe(monthly_data, width="stretch")
+
+                # Download Excel
+                create_excel_download(
+                    monthly_data,
+                    "laporan_hpp_bulanan",
+                    "📥 Download Excel"
+                )
+
+                fig_monthly = px.bar(
+                    monthly_data,
+                    x='Unit',
+                    y='Total HPP',
+                    color='Bulan',
+                    title="Trend HPP Bulanan per Unit",
+                    labels={'Total HPP': 'Total HPP (Rp)', 'Unit': 'Unit'},
+                    barmode='group'
+                )
+                st.plotly_chart(fig_monthly, use_container_width=True)
+
+            # Ringkasan per Unit
+            st.markdown("### 🏠 Ringkasan per Unit")
+            unit_summary = (
+                df_hpp.groupby('unit')['harga']
+                .agg(['sum', 'count', 'mean'])
+                .reset_index()
+                .rename(
+                    columns={
+                        'unit': 'Unit',
+                        'sum': 'Total HPP',
+                        'count': 'Jumlah Transaksi',
+                        'mean': 'Rata-rata HPP'
+                    }
+                )
+                .sort_values('Total HPP', ascending=False)
+            )
+
+            st.dataframe(unit_summary, width="stretch")
+
+            # Download Excel
+            create_excel_download(
+                unit_summary,
+                "ringkasan_hpp_unit",
+                "📥 Download Excel"
+            )
+
+            # Pie Chart
+            fig_pie = px.pie(
+                unit_summary,
+                values='Total HPP',
+                names='Unit',
+                title="Distribusi HPP per Unit"
+            )
+            st.plotly_chart(fig_pie, use_container_width=True)
+        else:
+            st.info("🔭 Belum ada data HPP.")
+
+    with tab3:
+        st.subheader("📋 Ringkasan Total")
+
+        df_hpp = get_hpp_data()
+
+        if not df_hpp.empty:
+            # Konversi tanggal string ke datetime untuk keperluan analisis
+            df_hpp['tanggal'] = pd.to_datetime(df_hpp['tanggal'], errors='coerce', dayfirst=True)
+
+            # Filter Unit
+            filter_unit_total = st.selectbox(
+                "🏠 Pilih Unit",
+                ["Semua"] + sorted(df_hpp['unit'].dropna().unique().tolist()),
+                key="filter_unit_total"
+            )
+
+            if filter_unit_total != "Semua":
+                df_hpp = df_hpp[df_hpp['unit'] == filter_unit_total]
+
+            # Pastikan tanggal ditampilkan kembali dalam format dd/mm/yyyy
+            df_hpp['tanggal'] = df_hpp['tanggal'].dt.strftime('%d/%m/%Y')
+
+            # Hitung metrik ringkasan
+            total_hpp_all = df_hpp['harga'].sum()
+            total_transaksi = len(df_hpp)
+            rata_rata_hpp = df_hpp['harga'].mean()
+            hpp_tertinggi = df_hpp['harga'].max()
+            hpp_terendah = df_hpp['harga'].min()
+
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("💰 Total HPP Keseluruhan", f"Rp {total_hpp_all:,.0f}".replace(",", "."))
+                st.metric("📝 Total Transaksi", total_transaksi)
+            with col2:
+                st.metric("📊 Rata-rata HPP", f"Rp {rata_rata_hpp:,.0f}".replace(",", "."))
+                st.metric("⬆️ HPP Tertinggi", f"Rp {hpp_tertinggi:,.0f}".replace(",", "."))
+            with col3:
+                st.metric("⬇️ HPP Terendah", f"Rp {hpp_terendah:,.0f}".replace(",", "."))
+
+            # 🔝 Top Material
+            st.markdown("### 🔝 Top 15 Material dengan HPP Tertinggi")
+            top_materials = (
+                df_hpp.groupby('material')['harga']
+                .sum()
+                .reset_index()
+                .sort_values('harga', ascending=False)
+                .head(15)
+            )
+            top_materials['harga_formatted'] = top_materials['harga'].apply(lambda x: f"Rp {x:,.0f}".replace(",", "."))
+
+            st.dataframe(top_materials[['material', 'harga_formatted']], width="stretch")
+
+            # Bar Chart
+            fig_top = px.bar(
+                top_materials,
+                x='material',
+                y='harga',
+                title=f"Top 15 Material dengan Total HPP Tertinggi ({filter_unit_total})",
+                labels={'harga': 'Total HPP (Rp)', 'material': 'Material'}
+            )
+            fig_top.update_layout(xaxis_tickangle=-45, height=500)
+            st.plotly_chart(fig_top, use_container_width=True)
+
+            # Download Excel
+            create_excel_download(
+                top_materials[['material', 'harga_formatted']],
+                "top15_material_hpp",
+                "📥 Download Excel"
+            )
+
+        else:
+            st.info("🔭 Belum ada data HPP.")
 
 # Stok Rendah
 elif menu == "⚠️ Stok Rendah":
@@ -1794,14 +2452,13 @@ elif menu == "📥 Import/Export Data":
             st.info("💡 **Tips:** Simpan backup secara rutin (minimal seminggu sekali) untuk keamanan data Anda.")
 
 # Footer
-st.markdown("---")
 st.markdown("""
 <div style="text-align: center; color: #666; padding: 20px;">
-    <h4>🏭 Aplikasi Inventory Gudang v3.7</h4>
+    <h4>🏭 Aplikasi Inventory Gudang v4.0</h4>
     <p>🚀 Running on Google Colab | Built with ❤️ using Streamlit & SQLite</p>
     <p>📱 Kelola inventory Gudang Anda dengan mudah!</p>
     <br>
-    <p><strong>✨ Update v3.7:</strong></p>
-    <p>✅ Chart Laporan Mingguan & Bulanan Diperbaiki | ✅ Style Sama dengan Dashboard | ✅ Grouped Bar Chart</p>
+    <p><strong>✨ Update v4.0:</strong></p>
+    <p>✅ Fitur HPP (Harga Pokok Produksi) | ✅ Import HPP dari Excel | ✅ Laporan HPP Lengkap</p>
 </div>
 """, unsafe_allow_html=True)
