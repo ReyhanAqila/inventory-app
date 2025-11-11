@@ -33,6 +33,69 @@ import os
 import sys
 import re
 
+try:
+    from google.oauth2 import service_account
+    from googleapiclient.discovery import build
+    from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
+except Exception:
+        # Jika lib belum terinstal saat pengembangan lokal, biarkan — Streamlit Cloud akan menginstall dari requirements.
+        pass
+
+import io as _io_temp
+
+def _get_drive_service():
+    sa_json = st.secrets.get("GDRIVE_SERVICE_ACCOUNT", None)
+    if not sa_json:
+        st.error("Service account credentials tidak ditemukan di st.secrets['GDRIVE_SERVICE_ACCOUNT']. Tambahkan di Streamlit Cloud → Manage app → Secrets.")
+        st.stop()
+    try:
+        sa_info = json.loads(sa_json)
+    except Exception as e:
+        st.error("Invalid JSON di GDRIVE_SERVICE_ACCOUNT: " + str(e))
+        st.stop()
+    creds = service_account.Credentials.from_service_account_info(sa_info, scopes=["https://www.googleapis.com/auth/drive"])
+    service = build("drive", "v3", credentials=creds, cache_discovery=False)
+    return service
+
+def download_db_from_drive(file_id, local_path):
+    try:
+        drive = _get_drive_service()
+        request = drive.files().get_media(fileId=file_id)
+        fh = _io_temp.BytesIO()
+        downloader = MediaIoBaseDownload(fh, request)
+        done = False
+        while not done:
+            status, done = downloader.next_chunk()
+        with open(local_path, "wb") as f:
+            f.write(fh.getbuffer())
+        return True, "Downloaded DB from Drive."
+    except Exception as e:
+        return False, str(e)
+
+def upload_db_to_drive(file_id, local_path):
+    try:
+        drive = _get_drive_service()
+        media = MediaFileUpload(local_path, mimetype="application/x-sqlite3", resumable=True)
+        updated = drive.files().update(fileId=file_id, media_body=media).execute()
+        return True, "Uploaded DB to Drive."
+    except Exception as e:
+        return False, str(e)
+
+def upload_after_write(local_db_path='inventory_rumah.db'):
+    DRIVE_FILE_ID = st.secrets.get("DRIVE_FILE_ID", None)
+    if not DRIVE_FILE_ID:
+        st.warning("DRIVE_FILE_ID tidak ada di secrets; melewatkan upload_after_write.")
+        return
+    ok, msg = upload_db_to_drive(DRIVE_FILE_ID, local_db_path)
+    if not ok:
+        st.warning("Auto-upload gagal: " + str(msg))
+    else:
+        # gunakan st.toast() jika tersedia, atau st.success()
+        try:
+            st.toast("Database auto-synced to Drive.")
+        except Exception:
+            st.success("Database auto-synced to Drive.")
+
 def get_resource_path(relative_path):
     try:
         base_path = sys._MEIPASS
@@ -47,6 +110,17 @@ st.set_page_config(
     page_icon="📦",
     layout="wide"
 )
+
+# ---------- STARTUP: pastikan DB ada lokal dengan mendownload dari Drive ----------
+DRIVE_FILE_ID = st.secrets.get("DRIVE_FILE_ID", None)
+LOCAL_DB = "inventory_rumah.db"
+if DRIVE_FILE_ID and not os.path.exists(LOCAL_DB):
+    ok, msg = download_db_from_drive(DRIVE_FILE_ID, LOCAL_DB)
+    if ok:
+        st.info("Database berhasil didownload dari Google Drive saat startup.")
+    else:
+        st.warning("Gagal download DB dari Drive saat startup: " + str(msg))
+
 
 # Session state
 if 'last_submission' not in st.session_state:
@@ -172,6 +246,7 @@ def init_db():
 
     conn.commit()
     conn.close()
+    upload_after_write(LOCAL_DB)
 
 # ================= HPP FUNCTIONS =================
 
@@ -256,12 +331,12 @@ def add_hpp_data(unit, tanggal, material, harga, keterangan=""):
                  VALUES (?, ?, ?, ?, ?)""", (unit, tanggal, material, harga, keterangan))
     conn.commit()
     conn.close()
+    upload_after_write(LOCAL_DB)
 
 def get_hpp_data(unit=None, start_date=None, end_date=None):
     conn = sqlite3.connect('inventory_rumah.db')
     df = pd.read_sql_query("SELECT * FROM hpp", conn)
     conn.close()
-
     if df.empty:
         return df
 
@@ -320,6 +395,7 @@ def delete_hpp(hpp_id):
     c.execute("DELETE FROM hpp WHERE id = ?", (hpp_id,))
     conn.commit()
     conn.close()
+    upload_after_write(LOCAL_DB)
     return True, "Data HPP berhasil dihapus"
 
 # ================= BARANG FUNCTIONS =================
@@ -339,6 +415,7 @@ def add_barang(nama, stok, besaran, gudang, tanggal_dibuat):
 
     conn.commit()
     conn.close()
+    upload_after_write(LOCAL_DB)
 
 def kurangi_stok(barang_id, stok_dikurangi, tanggal_transaksi):
     conn = sqlite3.connect('inventory_rumah.db')
@@ -363,6 +440,7 @@ def kurangi_stok(barang_id, stok_dikurangi, tanggal_transaksi):
 
         conn.commit()
         conn.close()
+        upload_after_write(LOCAL_DB)
         return True, f"Stok berhasil dikurangi {stok_dikurangi}"
 
     conn.close()
@@ -387,6 +465,7 @@ def update_stok(barang_id, stok_tambahan, tanggal_transaksi):
 
         conn.commit()
         conn.close()
+        upload_after_write(LOCAL_DB)
 
 def get_barang():
     conn = sqlite3.connect('inventory_rumah.db')
@@ -426,6 +505,7 @@ def delete_barang(barang_id):
     c.execute("DELETE FROM barang WHERE id = ?", (barang_id,))
     conn.commit()
     conn.close()
+    upload_after_write(LOCAL_DB)
     return True, f"Barang '{nama_barang}' berhasil dihapus"
 
 def delete_penggunaan(penggunaan_id):
@@ -434,6 +514,7 @@ def delete_penggunaan(penggunaan_id):
     c.execute("DELETE FROM peminjaman WHERE id = ?", (penggunaan_id,))
     conn.commit()
     conn.close()
+    upload_after_write(LOCAL_DB)
     return True, "Riwayat penggunaan berhasil dihapus"
 
 def delete_riwayat_stok(riwayat_id):
@@ -442,6 +523,7 @@ def delete_riwayat_stok(riwayat_id):
     c.execute("DELETE FROM riwayat_stok WHERE id = ?", (riwayat_id,))
     conn.commit()
     conn.close()
+    upload_after_write(LOCAL_DB)
     return True, "Riwayat penambahan stok berhasil dihapus"
 
 def add_peminjaman(barang_id, nama_barang, jumlah, tanggal, unit, besaran, gudang):
@@ -465,6 +547,7 @@ def add_peminjaman(barang_id, nama_barang, jumlah, tanggal, unit, besaran, gudan
 
         conn.commit()
         conn.close()
+        upload_after_write(LOCAL_DB)
 
         return True, f"Berhasil menggunakan {jumlah} {besaran} {nama_barang} untuk unit {unit}"
 
@@ -507,6 +590,7 @@ def add_sample_data():
 
     conn.commit()
     conn.close()
+    upload_after_write(LOCAL_DB)
 
 # Inisialisasi
 init_db()
@@ -2081,6 +2165,7 @@ elif menu == "📥 Import/Export Data":
 
                             conn.commit()
                             conn.close()
+                            upload_after_write(LOCAL_DB)
 
                             if total_imported > 0 or total_updated > 0:
                                 st.success(f"✅ Berhasil import barang masuk! **{total_imported}** barang baru dan **{total_updated}** penambahan stok!")
