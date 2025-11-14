@@ -2398,11 +2398,31 @@ elif menu == "📥 Import/Export Data":
 
                                             tanggal_penggunaan = tanggal_senin + timedelta(days=day_idx)
 
+                                           # --- Tambah ke tabel peminjaman seperti biasa ---
                                             c.execute("""INSERT INTO peminjaman
-                                                             (barang_id, nama_barang, jumlah_pinjam, tanggal_pinjam,
-                                                              unit, besaran_stok, gudang)
-                                                             VALUES (NULL, ?, ?, ?, ?, ?, 'Gudang 1')""",
-                                                            (nama_barang, jumlah, tanggal_penggunaan, unit, satuan))
+                                                            (barang_id, nama_barang, jumlah_pinjam, tanggal_pinjam,
+                                                            unit, besaran_stok, gudang)
+                                                            VALUES (NULL, ?, ?, ?, ?, ?, 'Gudang 1')""",
+                                                        (nama_barang, jumlah, tanggal_penggunaan, unit, satuan))
+
+                                            # --- Kurangi stok langsung berdasarkan nama barang ---
+                                            c.execute("SELECT id, stok, gudang FROM barang WHERE LOWER(nama_barang) = LOWER(?)", (nama_barang,))
+                                            barang_data = c.fetchone()
+
+                                            if barang_data:
+                                                barang_id, stok_sekarang, gudang = barang_data
+                                                stok_baru = stok_sekarang - jumlah
+                                                if stok_baru < 0:
+                                                    stok_baru = 0
+
+                                                c.execute("UPDATE barang SET stok = ? WHERE id = ?", (stok_baru, barang_id))
+
+                                                # Tambahkan riwayat stok sebagai pengurangan
+                                                c.execute("""
+                                                    INSERT INTO riwayat_stok
+                                                    (barang_id, nama_barang, jumlah_tambah, stok_sebelum, stok_sesudah, gudang, tanggal_tambah)
+                                                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                                                """, (barang_id, nama_barang, -jumlah, stok_sekarang, stok_baru, gudang, tanggal_penggunaan))
 
                                             total_imported += 1
 
