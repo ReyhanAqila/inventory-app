@@ -599,7 +599,6 @@ add_sample_data()
 
 # Header aplikasi
 st.title("📦 Aplikasi Inventory Gudang")
-st.markdown("*🚀 Running on Google Colab - Version 4.0 (HPP Feature)*")
 st.markdown("---")
 
 # Sidebar
@@ -2560,11 +2559,8 @@ elif menu == "📥 Import/Export Data":
 # Footer
 st.markdown("""
 <div style="text-align: center; color: #666; padding: 20px;">
-    <h4>🏭 Aplikasi Inventory Gudang v4.0</h4>
-    <p>🚀 Running on Google Colab | Built with ❤️ using Streamlit & SQLite</p>
+    <h4>🏭 Aplikasi Inventory Gudang </h4>
     <p>📱 Kelola inventory Gudang Anda dengan mudah!</p>
     <br>
-    <p><strong>✨ Update v4.0:</strong></p>
-    <p>✅ Fitur HPP (Harga Pokok Produksi) | ✅ Import HPP dari Excel | ✅ Laporan HPP Lengkap</p>
 </div>
 """, unsafe_allow_html=True)
