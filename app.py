@@ -2453,8 +2453,6 @@ elif menu == "📥 Import/Export Data":
 
     with tab3:
         st.subheader("💾 Export/Backup Data")
-        st.info("💡 Pastikan pustaka `xlsxwriter` dan `openpyxl` sudah terinstal di lingkungan Anda untuk fungsi export ini.")
-        st.code("!pip install xlsxwriter openpyxl", language='bash')
         st.markdown("---")
 
         st.markdown("""
